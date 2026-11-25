@@ -1,0 +1,10 @@
+/Binaries/
+/Intermediate/
+/Saved/
+/Build/
+/.vs/
+/.install.lock
+*.sln
+*.pdb
+*.VC.db
+*.VC.opendb
