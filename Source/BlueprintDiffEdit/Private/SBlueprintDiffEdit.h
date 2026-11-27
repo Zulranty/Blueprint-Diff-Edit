@@ -8,11 +8,13 @@
 #include "Containers/StaticArray.h"
 #include "DiffResults.h"
 #include "ISourceControlProvider.h"
+#include "SBlueprintDiffChanges.h"
 #include "UObject/StrongObjectPtr.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/Views/SListView.h"
 
 class IBlueprintEditor;
+class ISinglePropertyView;
 class ISourceControlRevision;
 class SBox;
 class SDockTab;
@@ -47,12 +49,15 @@ struct FBlueprintDiffChange
 	FText RevisionValue;
 	FText WorkingValue;
 	FName WorkingWidget = NAME_None;
+	FBlueprintSettingTarget Setting;
 };
 
 class SBlueprintDiffEdit final : public SCompoundWidget
 {
 public:
 	SLATE_BEGIN_ARGS(SBlueprintDiffEdit) {}
+		SLATE_EVENT(FBlueprintDiffOpenAsset, OnOpenBlueprint)
+		SLATE_EVENT(FBlueprintDiffBeforeReload, OnBeforeReload)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments & aArgs, const TSharedRef<IBlueprintEditor> & aEditor,
@@ -60,6 +65,7 @@ public:
 	~SBlueprintDiffEdit();
 
 	bool IsHostedBy(const SDockTab * aTab) const;
+	bool IsEditingAnyFile(const TArray<FString> & aFiles) const;
 	void Close();
 
 	virtual void Tick(const FGeometry & aGeometry, double aTime, float aDelta) override;
@@ -74,6 +80,7 @@ private:
 		OuterSplit,
 		FunctionsSplit,
 		RevisionSplit,
+		ChangedFilesSplit,
 		PaneSplitCount
 	};
 
@@ -101,6 +108,11 @@ private:
 	void DoRefreshChanges();
 	void DoSelectGraph(FGraphPtr aGraph, ESelectInfo::Type aSelectInfo);
 	void DoFocusChange(FChangePtr aChange, ESelectInfo::Type aSelectInfo);
+	void DoSelectSettingMember(FChangePtr aChange);
+	void DoShowSettingChange(const FChangePtr & aChange);
+	TSharedPtr<SWidget> DoBuildSettingMenu();
+	void DoRevertSetting(FBlueprintSettingTarget aSetting, TWeakObjectPtr<UBlueprint> aRevision);
+	bool CanEditBlueprint() const;
 	void DoFocusFirstChange();
 	void DoShowWidgetChange(const FBlueprintDiffChange & aChange, bool aSelectWidget);
 	TSharedRef<SWidget> DoGetWidgetPreview();
@@ -158,6 +170,10 @@ private:
 	TArray<FGraphPtr> m_Graphs;
 	TArray<FChangePtr> m_Changes;
 	TArray<FBlueprintSettingChange> m_Settings;
+	FChangePtr m_ActiveSetting;
+	TWeakObjectPtr<UObject> m_SettingObject;
+	TSharedPtr<SWidget> m_SettingComparison;
+	TSharedPtr<ISinglePropertyView> m_SingleSettingEditor;
 	TArray<FBlueprintWidgetChange> m_Widgets;
 	TStrongObjectPtr<UWidgetTree> m_RevisionWidgetTree;
 	TArray<TStrongObjectPtr<UWidgetTree>> m_RevisionSlotTrees;

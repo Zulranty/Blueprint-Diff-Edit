@@ -17,10 +17,13 @@
 #include "Containers/Ticker.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraphSchema_K2.h"
+#include "EdGraphSchema_K2_Actions.h"
+#include "Editor.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "GameFramework/Actor.h"
 #include "K2Node_Composite.h"
+#include "K2Node_FunctionEntry.h"
 #include "K2Node_IfThenElse.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
@@ -40,7 +43,10 @@
 #include "Framework/Commands/InputBindingManager.h"
 #include "Framework/Commands/UICommandList.h"
 #include "Input/Events.h"
+#include "ISinglePropertyView.h"
 #include "Layout/ArrangedChildren.h"
+#include "PropertyHandle.h"
+#include "SMyBlueprint.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/Layout/SSplitter.h"
 #include "UObject/Linker.h"
@@ -354,6 +360,130 @@ void FBlueprintDiffToolbarTests::DoCheckDivider(SSplitter & aSplitter, const FVe
 
 void FBlueprintDiffToolbarTests::Define()
 {
+	It("Selects native Blueprint members and edits or reverts their diff settings", [this]
+	{
+		const TStrongObjectPtr<UBlueprint> lRevision(CreateFixtureBlueprint());
+		const TStrongObjectPtr<UBlueprint> lWorking(CreateFixtureBlueprint());
+		ON_SCOPE_EXIT
+		{
+			lRevision->GetOutermost()->SetDirtyFlag(false);
+			lWorking->GetOutermost()->SetDirtyFlag(false);
+		};
+
+		const FName lVariable(TEXT("RotationSpeed"));
+		const FName lAddedVariable(TEXT("AddedSpeed"));
+		const FName lRemovedVariable(TEXT("RemovedSpeed"));
+		const FName lDispatcher(TEXT("OnRotationChanged"));
+		const FName lOldParam(TEXT("PreviousSpeed"));
+		FEdGraphPinType lNumber;
+		lNumber.PinCategory = UEdGraphSchema_K2::PC_Real;
+		lNumber.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+		FEdGraphPinType lDelegateType;
+		lDelegateType.PinCategory = UEdGraphSchema_K2::PC_MCDelegate;
+		for (UBlueprint * const lBlueprint : { lRevision.Get(), lWorking.Get() })
+		{
+			const bool lOld = lBlueprint == lRevision.Get();
+			if (!TestTrue(TEXT("Test members created"), FBlueprintEditorUtils::AddMemberVariable(lBlueprint, lVariable, lNumber,
+				lOld ? TEXT("1.25") : TEXT("2.5")) && FBlueprintEditorUtils::AddMemberVariable(lBlueprint, lDispatcher, lDelegateType)
+				&& FBlueprintEditorUtils::AddMemberVariable(lBlueprint, lOld ? lRemovedVariable : lAddedVariable, lNumber, TEXT("6.5"))))
+				return;
+			UEdGraph * const lGraph = FBlueprintEditorUtils::CreateNewGraph(lBlueprint, lDispatcher,
+				UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+			const UEdGraphSchema_K2 * const lSchema = GetDefault<UEdGraphSchema_K2>();
+			lGraph->bEditable = false;
+			lSchema->CreateDefaultNodesForGraph(*lGraph);
+			lSchema->CreateFunctionGraphTerminators(*lGraph, static_cast<UClass *>(nullptr));
+			lSchema->AddExtraFunctionFlags(lGraph, FUNC_BlueprintCallable | FUNC_BlueprintEvent | FUNC_Public);
+			lSchema->MarkFunctionEntryAsEditable(lGraph, true);
+			TArray<UK2Node_FunctionEntry *> lEntries;
+			lGraph->GetNodesOfClass(lEntries);
+			lEntries[0]->CreateUserDefinedPin(lOld ? lOldParam : FName(TEXT("CurrentSpeed")), lNumber, EGPD_Output);
+			lBlueprint->DelegateSignatureGraphs.Add(lGraph);
+			FKismetEditorUtilities::CompileBlueprint(lBlueprint);
+		}
+
+		FBlueprintEditorModule & lModule = FModuleManager::LoadModuleChecked<FBlueprintEditorModule>("Kismet");
+		const TSharedRef<IBlueprintEditor> lEditor = lModule.CreateBlueprintEditor(EToolkitMode::Standalone, nullptr, lWorking.Get(), false);
+		ON_SCOPE_EXIT { lEditor->CloseWindow(EAssetEditorCloseReason::AssetEditorHostClosed); };
+		const TSharedPtr<SDockTab> lHost = lEditor->GetTabManager()->GetOwnerTab();
+		if (!TestNotNull(TEXT("Blueprint editor tab"), lHost.Get()))
+			return;
+		const TSharedRef<SBlueprintDiffEdit> lDiff = SNew(SBlueprintDiffEdit, lEditor, lHost.ToSharedRef(), lWorking.Get());
+		lHost->SetContent(lDiff);
+		ON_SCOPE_EXIT { lDiff->Close(); };
+		lDiff->m_RevisionBlueprint.Reset(lRevision.Get());
+		lDiff->DoRebuildGraphList();
+		const TSharedPtr<SMyBlueprint> lMyBlueprint = static_cast<FBlueprintEditor &>(*lEditor).GetMyBlueprintWidget();
+		if (!TestNotNull(TEXT("Native My Blueprint panel"), lMyBlueprint.Get()))
+			return;
+
+		const auto lSelect = [&](EBlueprintSettingKind aKind, FName aName)
+		{
+			const auto * lFound = lDiff->m_Changes.FindByPredicate([&](const auto & aChange)
+			{
+				return aChange->Setting.Kind == aKind && aChange->Setting.Member == aName;
+			});
+			const auto lRow = lFound ? *lFound : TSharedPtr<FBlueprintDiffChange>();
+			if (lRow)
+			{
+				lDiff->m_ChangeList->SetSelection(lRow, ESelectInfo::OnMouseClick);
+				lDiff->m_ChangeList->Private_OnItemClicked(lRow);
+			}
+			return lRow;
+		};
+		const auto lDefaultRow = lSelect(EBlueprintSettingKind::ClassDefault, lVariable);
+		if (!TestTrue(TEXT("Default row and inline property editor"), lDefaultRow.IsValid() && lDiff->m_SingleSettingEditor.IsValid()))
+			return;
+		TestTrue(TEXT("Clicking the row selects the variable in the real editor"),
+			lMyBlueprint->SelectionAsVar() && lMyBlueprint->SelectionAsVar()->GetVariableName() == lVariable);
+		const TSharedPtr<IPropertyHandle> lInline = lDiff->m_SingleSettingEditor->GetPropertyHandle();
+		if (!TestTrue(TEXT("The inline editor can write the current value"), lInline && lInline->SetValue(3.75) == FPropertyAccess::Success))
+			return;
+		const auto lCurrentDefault = [&](FName aName)
+		{
+			const UObject * const lCDO = DiffUtils::GetCDO(lWorking.Get());
+			const FDoubleProperty * const lProperty = FindFProperty<FDoubleProperty>(lCDO->GetClass(), aName);
+			return lProperty ? lProperty->GetPropertyValue_InContainer(lCDO) : -1.0;
+		};
+		TestEqual(TEXT("The real Blueprint CDO receives the edit"), lCurrentDefault(lVariable), 3.75);
+		TestTrue(TEXT("The setting row has a context menu"), lDiff->DoBuildSettingMenu().IsValid());
+		lDiff->DoRevertSetting(lDefaultRow->Setting, lRevision.Get());
+		TestEqual(TEXT("Revert restores the selected revision default"), lCurrentDefault(lVariable), 1.25);
+		GEditor->UndoTransaction();
+		TestEqual(TEXT("Undo restores the user edit"), lCurrentDefault(lVariable), 3.75);
+		lDiff->DoRebuildGraphList();
+
+		const auto lSignatureRow = lSelect(EBlueprintSettingKind::DispatcherSignature, lDispatcher);
+		if (!TestTrue(TEXT("The dispatcher signature appears in Settings"), lSignatureRow.IsValid()))
+			return;
+		TestTrue(TEXT("Clicking the row selects the native event dispatcher"), lMyBlueprint->SelectionAsDelegate()
+			&& lMyBlueprint->SelectionAsDelegate()->GetDelegateName() == lDispatcher);
+		lDiff->DoRevertSetting(lSignatureRow->Setting, lRevision.Get());
+		TArray<UK2Node_FunctionEntry *> lEntries;
+		BlueprintDiffModel::FindDispatcherSignature(lWorking.Get(), lDispatcher)->GetNodesOfClass(lEntries);
+		TestTrue(TEXT("The dispatcher retains the revision parameter"), lEntries.Num() == 1 && lEntries[0]->FindPin(lOldParam));
+		TestEqual(TEXT("Reverting the dispatcher preserves the edited variable"), lCurrentDefault(lVariable), 3.75);
+
+		const auto lAddedRow = lSelect(EBlueprintSettingKind::ClassDefault, lAddedVariable);
+		if (!TestTrue(TEXT("A default with no revision value still has a diff row"), lAddedRow.IsValid()))
+			return;
+		TestTrue(TEXT("An added variable is selected in My Blueprint"),
+			lMyBlueprint->SelectionAsVar() && lMyBlueprint->SelectionAsVar()->GetVariableName() == lAddedVariable);
+		lDiff->DoRevertSetting(lAddedRow->Setting, lRevision.Get());
+		TestEqual(TEXT("Reverting an unused added variable removes the declaration"),
+			FBlueprintEditorUtils::FindNewVariableIndex(lWorking.Get(), lAddedVariable), INDEX_NONE);
+		TestEqual(TEXT("Reverting the declaration also clears its compiled default"), lCurrentDefault(lAddedVariable), -1.0);
+
+		const auto lRemovedRow = lSelect(EBlueprintSettingKind::Member, lRemovedVariable);
+		if (!TestTrue(TEXT("A removed variable has a diff row"), lRemovedRow.IsValid()))
+			return;
+		lDiff->DoRevertSetting(lRemovedRow->Setting, lRevision.Get());
+		TestTrue(TEXT("Revert restores the missing declaration"),
+			FBlueprintEditorUtils::FindNewVariableIndex(lWorking.Get(), lRemovedVariable) != INDEX_NONE);
+		TestEqual(TEXT("Revert restores the old variable's default"), lCurrentDefault(lRemovedVariable), 6.5);
+		TestEqual(TEXT("Other values stay edited"), lCurrentDefault(lVariable), 3.75);
+	});
+
 	It("Compares a Widget Blueprint beside its native Designer", [this]
 	{
 		const TStrongObjectPtr<UWidgetBlueprint> lRevision(CreateWidgetFixtureBlueprint(FText::FromString(TEXT("Before"))));
@@ -504,8 +634,67 @@ void FBlueprintDiffToolbarTests::Define()
 
 		lGraph->RemoveNode(lOldBranch);
 		FKismetEditorUtilities::CompileBlueprint(lWorking.Get());
-		FBlueprintEditorModule & lModule = FModuleManager::LoadModuleChecked<FBlueprintEditorModule>("Kismet");
-		const TSharedRef<IBlueprintEditor> lEditor = lModule.CreateBlueprintEditor(EToolkitMode::Standalone, nullptr, lWorking.Get(), false);
+		if (!TestTrue(TEXT("Edited working Blueprint is saved"), UPackage::SavePackage(lPackage, lWorking.Get(), *lFile, lSaveArgs)))
+			return;
+
+		const TSharedPtr<SDockTab> lChangesTab = FGlobalTabmanager::Get()->TryInvokeTab(FName(TEXT("BlueprintDiffEdit.GitChanges")));
+		if (!TestNotNull(TEXT("Registered Git Changes tab"), lChangesTab.Get()))
+			return;
+		ON_SCOPE_EXIT { lChangesTab->RequestCloseTab(); };
+		TestEqual(TEXT("The tab uses the shared file browser"), lChangesTab->GetContent()->GetType(), FName(TEXT("SBlueprintDiffChanges")));
+
+		const TSharedRef<SBlueprintDiffChanges> lFileBrowser = SNew(SBlueprintDiffChanges).ContextFilename(lFile);
+		TestTrue(TEXT("Standalone file list has a sidebar splitter"), lFileBrowser->m_FilterSplitter.IsValid());
+		constexpr TCHAR lFilterSection[] = TEXT("BlueprintDiffEdit.Layout");
+		constexpr TCHAR lFilterWidth[] = TEXT("GitChangesFiltersWidth");
+		constexpr TCHAR lFilterVisible[] = TEXT("GitChangesFiltersVisible");
+		FString lOriginalWidth, lOriginalVisible;
+		const bool lHadWidth = GConfig->GetString(lFilterSection, lFilterWidth, lOriginalWidth, GEditorPerProjectIni);
+		const bool lHadVisible = GConfig->GetString(lFilterSection, lFilterVisible, lOriginalVisible, GEditorPerProjectIni);
+		ON_SCOPE_EXIT
+		{
+			if (lHadWidth)
+				GConfig->SetString(lFilterSection, lFilterWidth, *lOriginalWidth, GEditorPerProjectIni);
+			else
+				GConfig->RemoveKey(lFilterSection, lFilterWidth, GEditorPerProjectIni);
+			if (lHadVisible)
+				GConfig->SetString(lFilterSection, lFilterVisible, *lOriginalVisible, GEditorPerProjectIni);
+			else
+				GConfig->RemoveKey(lFilterSection, lFilterVisible, GEditorPerProjectIni);
+			GConfig->Flush(false, GEditorPerProjectIni);
+		};
+		lFileBrowser->m_ShowFilters = true;
+		lFileBrowser->m_FilterSplitter->SlotAt(0).SetSizeValue(0.31f);
+		lFileBrowser->m_FilterSplitter->SlotAt(1).SetSizeValue(0.69f);
+		lFileBrowser->DoSaveFilterWidth();
+		lFileBrowser->DoToggleFilters();
+		const TSharedRef<SBlueprintDiffChanges> lReopenedBrowser = SNew(SBlueprintDiffChanges).ContextFilename(lFile);
+		TestFalse(TEXT("The sidebar stays hidden on reopen"), lReopenedBrowser->m_ShowFilters);
+		TestTrue(TEXT("Sidebar width is remembered while hidden"),
+			FMath::IsNearlyEqual(lReopenedBrowser->m_FilterSplitter->SlotAt(0).GetSizeValue(), 0.31f));
+		if (!TestTrue(TEXT("The actual list reads the Git working tree"), lFileBrowser->m_Request.WaitFor(FTimespan::FromSeconds(12))))
+			return;
+		lFileBrowser->Tick(FGeometry(), 0.0, 0.0f);
+		if (!TestEqual(TEXT("Edited asset appears in the changed files widget"), lFileBrowser->m_VisibleFiles.Num(), 1))
+		{
+			AddInfo(lFileBrowser->DoGetStatus().ToString());
+			return;
+		}
+		const auto lFileRow = lFileBrowser->m_VisibleFiles[0];
+		const TSharedRef<SBlueprintDiffChanges> lEmbedded = SNew(SBlueprintDiffChanges).ContextFilename(lFile).Compact(true);
+		if (!TestTrue(TEXT("The embedded list loads"), lEmbedded->m_Request.WaitFor(FTimespan::FromSeconds(12))))
+			return;
+		lEmbedded->Tick(FGeometry(), 0.0, 0.0f);
+		const auto lSelected = lEmbedded->m_List->GetSelectedItems();
+		TestTrue(TEXT("The open asset is selected by the embedded file list"), lSelected.Num() == 1
+			&& lEmbedded->IsCurrentAsset(*lSelected[0]));
+		lFileBrowser->m_List->SetSelection(lFileRow);
+		TestTrue(TEXT("The selected file has a context menu"), lFileBrowser->DoBuildMenu().IsValid());
+		TestTrue(TEXT("Double-click dispatches the actual row action"), lFileBrowser->m_List->Private_OnItemDoubleClicked(lFileRow));
+		const TSharedPtr<IBlueprintEditor> lOpened = FKismetEditorUtilities::GetIBlueprintEditorForObject(lWorking.Get(), false);
+		if (!TestNotNull(TEXT("Double-click opens the native Blueprint editor"), lOpened.Get()))
+			return;
+		const TSharedRef<IBlueprintEditor> lEditor = lOpened.ToSharedRef();
 		ON_SCOPE_EXIT { lEditor->CloseWindow(EAssetEditorCloseReason::AssetEditorHostClosed); };
 		const TSharedPtr<SDockTab> lHost = lEditor->GetTabManager()->GetOwnerTab();
 		if (!TestNotNull(TEXT("Native Blueprint toolkit host"), lHost.Get()))
@@ -899,8 +1088,14 @@ void FBlueprintDiffToolbarTests::Define()
 		{
 			return;
 		}
-		TestEqual(TEXT("Changed function list occupies the left column"),
-			lColumns->GetChildren()->GetChildAt(0)->GetTag(), FName(TEXT("BlueprintDiffEditFunctions")));
+		const TSharedRef<SWidget> lLeft = lColumns->GetChildren()->GetChildAt(0);
+		if (!TestEqual(TEXT("Functions and changed files splitter"), lLeft->GetType(), FName(TEXT("SSplitter")))
+			|| !TestEqual(TEXT("Two panes in the left column"), lLeft->GetChildren()->Num(), 2))
+			return;
+		TestEqual(TEXT("Changed function list occupies the upper left pane"),
+			lLeft->GetChildren()->GetChildAt(0)->GetTag(), FName(TEXT("BlueprintDiffEditFunctions")));
+		TestEqual(TEXT("Changed files occupy the lower left pane"),
+			lLeft->GetChildren()->GetChildAt(1)->GetType(), FName(TEXT("SBlueprintDiffChanges")));
 
 		const TSharedRef<SWidget> lRevision = lColumns->GetChildren()->GetChildAt(1);
 		if (!TestEqual(TEXT("Revision header and graph splitter"), lRevision->GetType(), FName(TEXT("SSplitter")))
@@ -914,7 +1109,7 @@ void FBlueprintDiffToolbarTests::Define()
 			lRevision->GetChildren()->GetChildAt(1)->GetTag(), FName(TEXT("BlueprintDiffEditBaselinePreview")));
 
 		constexpr TCHAR SECTION[] = TEXT("BlueprintDiffEdit.Layout");
-		const TCHAR * const lKeys[] = { TEXT("DiffWidth"), TEXT("FunctionsWidth"), TEXT("RevisionControlsHeight") };
+		const TCHAR * const lKeys[] = { TEXT("DiffWidth"), TEXT("FunctionsWidth"), TEXT("RevisionControlsHeight"), TEXT("FunctionsHeight") };
 		FString lOriginalValues[UE_ARRAY_COUNT(lKeys)];
 		bool lHadValues[UE_ARRAY_COUNT(lKeys)];
 		for (int32 lIndex = 0; lIndex < UE_ARRAY_COUNT(lKeys); ++lIndex)
@@ -947,6 +1142,7 @@ void FBlueprintDiffToolbarTests::Define()
 		DoCheckDivider(StaticCastSharedRef<SSplitter>(lRoot).Get(), FVector2f(2400.0f, 850.0f), true);
 		DoCheckDivider(StaticCastSharedRef<SSplitter>(lColumns).Get(), FVector2f(1100.0f, 850.0f), true);
 		DoCheckDivider(StaticCastSharedRef<SSplitter>(lRevision).Get(), FVector2f(470.0f, 850.0f), false);
+		DoCheckDivider(StaticCastSharedRef<SSplitter>(lLeft).Get(), FVector2f(410.0f, 850.0f), false);
 
 		for (int32 lIndex = 0; lIndex < UE_ARRAY_COUNT(lKeys); ++lIndex)
 		{

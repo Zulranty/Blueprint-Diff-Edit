@@ -171,13 +171,13 @@ namespace
 		}
 		if (lDirectory.IsEmpty())
 		{
-			aError = LOCTEXT("MissingRepositoryDirectory", "Could not locate the working directory for this Blueprint.");
+			aError = LOCTEXT("MissingRepositoryDirectory", "Could not locate the working directory for this file.");
 			return false;
 		}
 		const FGitResult lResult = RunGitText(aRequest, lDirectory, TEXT("rev-parse --show-toplevel"), aRoot);
 		if (!lResult.Succeeded() || aRoot.IsEmpty())
 		{
-			aError = DescribeFailure(LOCTEXT("GitRepositoryUnavailable", "Could not find the Git repository for this Blueprint"), lResult);
+			aError = DescribeFailure(LOCTEXT("GitRepositoryUnavailable", "Could not find the Git working tree"), lResult);
 			return false;
 		}
 		aRoot.TrimStartAndEndInline();
@@ -255,11 +255,8 @@ namespace
 		if (aRequest.Destination)
 			aResult.PackageBytes.Reset();
 	}
-	bool ParseFileHistory(const TArray<uint8> & aOutput, const FString & aRepository,
-		FString aTrackedPath, TArray<FBlueprintDiffGitRevision> & aRevisions)
+	bool SplitNulFields(const TArray<uint8> & aOutput, TArray<FString> & aFields)
 	{
-		// The leading NUL in the format marks each commit. Git adds one newline before the name-status record.
-		TArray<FString> lFields;
 		int32 lStart = 0;
 		for (int32 lIndex = 0; lIndex < aOutput.Num(); ++lIndex)
 		{
@@ -267,10 +264,64 @@ namespace
 				continue;
 
 			const FUTF8ToTCHAR lField(reinterpret_cast<const UTF8CHAR *>(aOutput.GetData() + lStart), lIndex - lStart);
-			lFields.Emplace(lField.Length(), lField.Get());
+			aFields.Emplace(lField.Length(), lField.Get());
 			lStart = lIndex + 1;
 		}
-		if (lStart != aOutput.Num())
+		return lStart == aOutput.Num();
+	}
+
+	bool IsWorkingTreePath(const FString & aPath)
+	{
+		FString lNormalized = aPath;
+		return !aPath.IsEmpty() && !aPath.EndsWith(TEXT("/")) && !aPath.Contains(TEXT("\\"))
+			&& FPaths::IsRelative(aPath) && FPaths::CollapseRelativeDirectories(lNormalized)
+			&& lNormalized.Equals(aPath, ESearchCase::CaseSensitive) && !aPath.StartsWith(TEXT("../"));
+	}
+
+	void ReadStatus(const FGitRequest & aRequest, FBlueprintDiffWorkingTree & aTree)
+	{
+		TArray<uint8> lOutput;
+		const FGitResult lResult = RunGit(aRequest, aTree.Repository,
+			TEXT("--no-optional-locks status --porcelain=v1 -z --untracked-files=all --ignore-submodules=all --renames"), lOutput);
+		if (!lResult.Succeeded())
+		{
+			aTree.Error = DescribeFailure(LOCTEXT("StatusFailed", "Could not read changed files"), lResult);
+			return;
+		}
+
+		TArray<FString> lFields;
+		const bool lComplete = SplitNulFields(lOutput, lFields);
+		for (int32 lIndex = 0; lComplete && lFields.IsValidIndex(lIndex); ++lIndex)
+		{
+			const FString & lRecord = lFields[lIndex];
+			if (lRecord.Len() < 4 || lRecord[2] != TEXT(' '))
+				break;
+
+			FBlueprintDiffChangedFile lFile { lRecord.Mid(3), {}, lRecord[0], lRecord[1] };
+			if (lFile.Index == TEXT('R') || lFile.Index == TEXT('C') || lFile.Working == TEXT('R') || lFile.Working == TEXT('C'))
+			{
+				if (!lFields.IsValidIndex(++lIndex) || !IsWorkingTreePath(lFields[lIndex]))
+					break;
+				lFile.OriginalPath = lFields[lIndex];
+			}
+			// An untracked nested repository can appear as a directory. It is not a file operation.
+			if (IsWorkingTreePath(lFile.Path))
+				aTree.Files.Add(MoveTemp(lFile));
+			if (lIndex == lFields.Num() - 1)
+				return;
+		}
+		if (lComplete && lFields.IsEmpty())
+			return;
+		aTree.Files.Reset();
+		aTree.Error = LOCTEXT("InvalidGitStatus", "Git returned an incomplete changed-files list.");
+	}
+
+	bool ParseFileHistory(const TArray<uint8> & aOutput, const FString & aRepository,
+		FString aTrackedPath, TArray<FBlueprintDiffGitRevision> & aRevisions)
+	{
+		// The leading NUL in the format marks each commit. Git adds one newline before the name-status record.
+		TArray<FString> lFields;
+		if (!SplitNulFields(aOutput, lFields))
 			return false;
 
 		for (int32 lCursor = 0; lCursor < lFields.Num(); )
@@ -348,6 +399,172 @@ FText FBlueprintDiffCommit::GetMenuLabel(bool aShowDate) const
 	return FText::FromString(FString::Join(lSegments, TEXT("  ·  ")));
 }
 
+bool FBlueprintDiffChangedFile::IsConflicted() const
+{
+	return Index == TEXT('U') || Working == TEXT('U')
+		|| (Index == Working && (Index == TEXT('A') || Index == TEXT('D')));
+}
+
+FBlueprintDiffWorkingTree BlueprintDiffGit::ReadWorkingTree(const FString & aExecutable, const FString & aContextFilename,
+	const TAtomic<bool> * aCancelled)
+{
+	FBlueprintDiffWorkingTree lTree;
+	const FGitRequest lRequest { aExecutable, aCancelled, nullptr };
+	if (LocateRepository(lRequest, aContextFilename, lTree.Repository, lTree.Error))
+		ReadStatus(lRequest, lTree);
+	return lTree;
+}
+
+bool BlueprintDiffGit::IsAssetFile(const FString & aFilename)
+{
+	return FPaths::GetExtension(aFilename).Equals(TEXT("uasset"), ESearchCase::IgnoreCase);
+}
+
+FBlueprintDiffProjectChanges BlueprintDiffGit::ReadProjectChanges(const FString & aExecutable,
+	const FString & aProjectDirectory, const TArray<FString> & aCandidateDirectories, const TAtomic<bool> * aCancelled)
+{
+	FBlueprintDiffProjectChanges lChanges;
+	const FString lScopes[] = {
+		aProjectDirectory / TEXT("Content"), aProjectDirectory / TEXT("Source"), aProjectDirectory / TEXT("Plugins")
+	};
+	const FGitRequest lRequest { aExecutable, aCancelled, nullptr };
+	TArray<FString> lRepositories;
+	FString lProjectRoot;
+	if (LocateRepository(lRequest, aProjectDirectory / TEXT(".uproject"), lProjectRoot, lChanges.Error))
+		lRepositories.Add(MoveTemp(lProjectRoot));
+
+	const auto lAddNestedRepository = [&](FString lDirectory)
+	{
+		while (FPaths::IsUnderDirectory(lDirectory, aProjectDirectory) && !FPaths::IsSamePath(lDirectory, aProjectDirectory))
+		{
+			const FString lGit = lDirectory / TEXT(".git");
+			if (IFileManager::Get().DirectoryExists(*lGit) || IFileManager::Get().FileExists(*lGit))
+			{
+				lRepositories.AddUnique(MoveTemp(lDirectory));
+				break;
+			}
+			lDirectory = FPaths::GetPath(lDirectory);
+		}
+	};
+	for (const FString & lScope : lScopes)
+		lAddNestedRepository(lScope);
+	for (const FString & lCandidate : aCandidateDirectories)
+	{
+		FString lDirectory = FPaths::ConvertRelativePathToFull(lCandidate);
+		FPaths::NormalizeDirectoryName(lDirectory);
+		for (const FString & lScope : lScopes)
+		{
+			if (FPaths::IsUnderDirectory(lDirectory, lScope) || FPaths::IsSamePath(lDirectory, lScope))
+			{
+				lAddNestedRepository(MoveTemp(lDirectory));
+				break;
+			}
+		}
+	}
+
+	bool lReadAny = false;
+	for (const FString & lRepository : lRepositories)
+	{
+		FBlueprintDiffWorkingTree lTree;
+		lTree.Repository = lRepository;
+		ReadStatus(lRequest, lTree);
+		if (!lTree.Error.IsEmpty())
+		{
+			lChanges.Error = MoveTemp(lTree.Error);
+			continue;
+		}
+		lReadAny = true;
+		for (FBlueprintDiffChangedFile & lFile : lTree.Files)
+		{
+			const FString lExtension = FPaths::GetExtension(lFile.Path).ToLower();
+			if (!IsAssetFile(lFile.Path) && lExtension != TEXT("cpp") && lExtension != TEXT("h")
+				&& lExtension != TEXT("hpp") && lExtension != TEXT("inl") && lExtension != TEXT("cc")
+				&& lExtension != TEXT("cxx") && lExtension != TEXT("hxx") && lExtension != TEXT("ipp")
+				&& lExtension != TEXT("c"))
+				continue;
+			FString lFilename = lRepository / lFile.Path;
+			for (const FString & lScope : lScopes)
+			{
+				if (FPaths::IsUnderDirectory(lFilename, lScope))
+				{
+					lChanges.Files.Add({ MoveTemp(lFile), lRepository, MoveTemp(lFilename) });
+					break;
+				}
+			}
+		}
+	}
+	if (lReadAny)
+		lChanges.Error = FText();
+	lChanges.Files.Sort([](const FBlueprintDiffProjectFile & aLeft, const FBlueprintDiffProjectFile & aRight)
+	{
+		return aLeft.Filename.Compare(aRight.Filename, ESearchCase::IgnoreCase) < 0;
+	});
+	return lChanges;
+}
+
+FText BlueprintDiffGit::StageFile(const FString & aExecutable, const FBlueprintDiffProjectFile & aFile)
+{
+	const bool lWorkingRename = aFile.Working == TEXT('R');
+	if (!aFile.IsWorking() || aFile.IsConflicted() || !IsWorkingTreePath(aFile.Path) || aFile.Path.Contains(TEXT("\""))
+		|| (lWorkingRename && (!IsWorkingTreePath(aFile.OriginalPath) || aFile.OriginalPath.Contains(TEXT("\"")))))
+		return LOCTEXT("InvalidStage", "This file does not have stageable working changes.");
+
+	const FGitRequest lRequest { aExecutable, nullptr, nullptr };
+	FBlueprintDiffWorkingTree lTree;
+	lTree.Repository = aFile.Repository;
+	ReadStatus(lRequest, lTree);
+	if (!lTree.Error.IsEmpty())
+		return lTree.Error;
+	if (!lTree.Files.Contains(static_cast<const FBlueprintDiffChangedFile &>(aFile)))
+		return LOCTEXT("ChangedBeforeStage", "The file status changed. Refresh the list and try again.");
+
+	FString lArguments = FString::Printf(TEXT("--literal-pathspecs add -A -- \"%s\""), *aFile.Path);
+	if (lWorkingRename)
+		lArguments += FString::Printf(TEXT(" \"%s\""), *aFile.OriginalPath);
+	TArray<uint8> lOutput;
+	const FGitResult lResult = RunGit(lRequest, aFile.Repository, lArguments, lOutput);
+	return lResult.Succeeded() ? FText() : DescribeFailure(LOCTEXT("StageFailed", "Could not stage the selected file"), lResult);
+}
+
+FText BlueprintDiffGit::RevertFile(const FString & aExecutable, const FString & aRepository,
+	const FBlueprintDiffChangedFile & aFile)
+{
+	if (aFile.IsConflicted() || !IsWorkingTreePath(aFile.Path) || aFile.Path.Contains(TEXT("\""))
+		|| (!aFile.OriginalPath.IsEmpty()
+			&& (!IsWorkingTreePath(aFile.OriginalPath) || aFile.OriginalPath.Contains(TEXT("\"")))))
+		return LOCTEXT("UnsafeRevert", "Resolve conflicting files in Git before reverting, and use a valid file path.");
+
+	const FGitRequest lRequest { aExecutable, nullptr, nullptr };
+	FBlueprintDiffWorkingTree lCurrent;
+	lCurrent.Repository = aRepository;
+	ReadStatus(lRequest, lCurrent);
+	if (!lCurrent.Error.IsEmpty())
+		return lCurrent.Error;
+	if (!lCurrent.Files.Contains(aFile))
+		return LOCTEXT("ChangedBeforeRevert", "The file status changed. Refresh the list and try again.");
+
+	if (aFile.IsUntracked())
+	{
+		return IFileManager::Get().Delete(*(aRepository / aFile.Path), true, false, true) ? FText()
+			: LOCTEXT("UntrackedDeleteFailed", "Could not remove the untracked file.");
+	}
+
+	FString lArguments = FString::Printf(TEXT("--literal-pathspecs restore --source=HEAD --staged --worktree -- \"%s\""),
+		*aFile.Path);
+	if (aFile.Index == TEXT('R') || aFile.Working == TEXT('R'))
+	{
+		const FString lOldFilename = aRepository / aFile.OriginalPath;
+		if (!FPaths::IsSamePath(lOldFilename, aRepository / aFile.Path)
+			&& (FPaths::FileExists(lOldFilename) || FPaths::DirectoryExists(lOldFilename)))
+			return FText::Format(LOCTEXT("OccupiedRenameSource", "The old path {0} is occupied by another file or folder."),
+				FText::FromString(aFile.OriginalPath));
+		lArguments += FString::Printf(TEXT(" \"%s\""), *aFile.OriginalPath);
+	}
+	TArray<uint8> lOutput;
+	const FGitResult lResult = RunGit(lRequest, aRepository, lArguments, lOutput);
+	return lResult.Succeeded() ? FText() : DescribeFailure(LOCTEXT("RevertFailed", "Could not revert the selected file"), lResult);
+}
+
 FString BlueprintDiffGit::GetExecutable()
 {
 	FString lConfiguredGit;
@@ -380,25 +597,31 @@ FBlueprintDiffMaster BlueprintDiffGit::ReadMaster(const FString & aExecutable, c
 	if (!LocateRepository(lRequest, aFilename, lRoot, lResult.Error))
 		return lResult;
 
-	FString lUnused;
-	FString lRef = TEXT("refs/remotes/origin/master");
-	const FGitResult lRemote = RunGitText(lRequest, lRoot, TEXT("show-ref --verify --quiet ") + lRef, lUnused);
-	if (lRemote.ExitCode == 1 && lRemote.Failure.IsEmpty())
-	{
-		lRef = TEXT("refs/heads/master");
-		lResult.Commit.Ref = TEXT("master");
-	}
-	else if (lRemote.Succeeded())
-		lResult.Commit.Ref = TEXT("origin/master");
+	FString lCommit;
+	FString lDefaultRef;
+	const FGitResult lSymbolic = RunGitText(lRequest, lRoot, TEXT("symbolic-ref --quiet refs/remotes/origin/HEAD"), lDefaultRef);
+	lDefaultRef.TrimEndInline();
+	if (lSymbolic.Succeeded() && lDefaultRef.StartsWith(TEXT("refs/remotes/origin/"))
+		&& ResolveCommit(lRequest, lRoot, TEXT("refs/remotes/origin/HEAD"), lCommit, lResult.Error))
+		lResult.Commit.Ref = lDefaultRef.RightChop(FCString::Strlen(TEXT("refs/remotes/")));
 	else
 	{
-		lResult.Error = DescribeFailure(LOCTEXT("MasterRefUnavailable", "Could not check origin/master"), lRemote);
-		return lResult;
+		const TCHAR * const lFallbacks[] = {
+			TEXT("refs/remotes/origin/master"), TEXT("refs/remotes/origin/main"), TEXT("refs/heads/master"), TEXT("refs/heads/main")
+		};
+		for (const TCHAR * lRef : lFallbacks)
+		{
+			if (ResolveCommit(lRequest, lRoot, lRef, lCommit, lResult.Error))
+			{
+				lResult.Commit.Ref = FString(lRef).RightChop(FCString::Strlen(
+					FCString::Strncmp(lRef, TEXT("refs/heads/"), 11) == 0 ? TEXT("refs/heads/") : TEXT("refs/remotes/")));
+				break;
+			}
+		}
+		if (lResult.Commit.Ref.IsEmpty())
+			return lResult;
 	}
-
-	FString lCommit;
-	if (!ResolveCommit(lRequest, lRoot, lRef, lCommit, lResult.Error))
-		return lResult;
+	lResult.Error = FText();
 
 	FString lMetadata;
 	const FString lShow = FString::Printf(TEXT("-c i18n.logOutputEncoding=UTF-8 show -s --no-show-signature --format=%%h%%n%%s%%n%%an%%n%%ai %s --"), *lCommit);

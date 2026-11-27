@@ -38,8 +38,50 @@ struct FBlueprintDiffFileHistory
 	bool bUseProvider = false;
 };
 
+struct FBlueprintDiffChangedFile
+{
+	FString Path;
+	FString OriginalPath;
+	TCHAR Index = TEXT(' ');
+	TCHAR Working = TEXT(' ');
+
+	bool IsUntracked() const { return Index == TEXT('?'); }
+	bool IsStaged() const { return Index != TEXT(' ') && !IsUntracked(); }
+	bool IsWorking() const { return Working != TEXT(' '); }
+	bool IsConflicted() const;
+	bool operator==(const FBlueprintDiffChangedFile & aOther) const = default;
+};
+
+struct FBlueprintDiffWorkingTree
+{
+	FString Repository;
+	TArray<FBlueprintDiffChangedFile> Files;
+	FText Error;
+};
+
+struct FBlueprintDiffProjectFile : FBlueprintDiffChangedFile
+{
+	FString Repository;
+	FString Filename;
+
+	bool operator==(const FBlueprintDiffProjectFile & aOther) const = default;
+};
+
+struct FBlueprintDiffProjectChanges
+{
+	TArray<FBlueprintDiffProjectFile> Files;
+	FText Error;
+};
+
 namespace BlueprintDiffGit
 {
+	FBlueprintDiffWorkingTree ReadWorkingTree(const FString & aExecutable, const FString & aContextFilename,
+		const TAtomic<bool> * aCancelled = nullptr);
+	FBlueprintDiffProjectChanges ReadProjectChanges(const FString & aExecutable, const FString & aProjectDirectory,
+		const TArray<FString> & aCandidateDirectories, const TAtomic<bool> * aCancelled = nullptr);
+	bool IsAssetFile(const FString & aFilename);
+	FText StageFile(const FString & aExecutable, const FBlueprintDiffProjectFile & aFile);
+	FText RevertFile(const FString & aExecutable, const FString & aRepository, const FBlueprintDiffChangedFile & aFile);
 	FBlueprintDiffFileHistory ReadFileHistory(const FString & aExecutable, const FString & aFilename,
 		TFunctionRef<void(TOptional<FBlueprintDiffGitRevision>)> aPublishLatest,
 		const TAtomic<bool> * aCancelled = nullptr, bool aPreload = true);

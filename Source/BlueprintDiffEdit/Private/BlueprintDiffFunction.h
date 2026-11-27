@@ -15,4 +15,10 @@ namespace BlueprintDiffFunction
 		UEdGraph * aWorkingGraph,
 		UEdGraph * aRevisionGraph,
 		FText & aError);
+	bool RevertDispatcher(
+		UBlueprint * aWorkingBlueprint,
+		const UBlueprint * aRevisionBlueprint,
+		UEdGraph * aWorkingGraph,
+		UEdGraph * aRevisionGraph,
+		FText & aError);
 }

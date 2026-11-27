@@ -199,6 +199,113 @@ void FBlueprintDiffGitTests::Define()
 			BlueprintDiffGit::ReadHistory(lGit, lFirst, lFirst, lCommit, &lCancelled).Error.IsEmpty());
 	});
 
+	It("Lists working and staged files and reverts only the selected file or rename", [this]
+	{
+		const FString lAsset = TEXT("Nested Project/[Asset] & data.uasset");
+		const FString lOther = TEXT("Nested Project/Other.txt");
+		const FString lFrom = TEXT("Nested Project/Before.txt");
+		const FString lTo = TEXT("Nested Project/After.txt");
+		const FString lNew = TEXT("Nested Project/New.txt");
+		const auto lWrite = [&](const FString & aPath, const TCHAR * aText)
+		{
+			return FFileHelper::SaveStringToFile(aText, *(m_Fixture / aPath), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+		};
+		if (!RunFixtureGit(TEXT("init --initial-branch=main")) || !lWrite(lAsset, TEXT("baseline"))
+			|| !lWrite(lOther, TEXT("other baseline")) || !lWrite(lFrom, TEXT("renamed content"))
+			|| !RunFixtureGit(TEXT("add -- .")) || !RunFixtureGit(TEXT("commit -m Initial"))
+			|| !RunFixtureGit(TEXT("update-ref refs/remotes/origin/main HEAD"))
+			|| !RunFixtureGit(TEXT("symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main"))
+			|| !lWrite(lAsset, TEXT("staged"))
+			|| !RunFixtureGit(TEXT("--literal-pathspecs add -- \"Nested Project/[Asset] & data.uasset\""))
+			|| !lWrite(lAsset, TEXT("working")) || !lWrite(lOther, TEXT("other edited")) || !lWrite(lNew, TEXT("new"))
+			|| !RunFixtureGit(TEXT("mv \"Nested Project/Before.txt\" \"Nested Project/After.txt\"")))
+			return;
+
+		const FString lGit = BlueprintDiffGit::GetExecutable();
+		const FString lContext = m_Fixture / lAsset;
+		const FBlueprintDiffMaster lDefault = BlueprintDiffGit::ReadMaster(lGit, lContext);
+		TestTrue(TEXT("GitHub-style origin/main resolves"), lDefault.Error.IsEmpty() && lDefault.Commit.Ref == TEXT("origin/main"));
+		const FBlueprintDiffWorkingTree lTree = BlueprintDiffGit::ReadWorkingTree(lGit, lContext);
+		if (!TestTrue(TEXT("Status read succeeds"), lTree.Error.IsEmpty())
+			|| !TestEqual(TEXT("All four rows are present"), lTree.Files.Num(), 4))
+			return;
+		const auto lFind = [&](const FString & aPath)
+		{
+			return lTree.Files.FindByPredicate([&aPath](const FBlueprintDiffChangedFile & aFile) { return aFile.Path == aPath; });
+		};
+		const auto * lEdited = lFind(lAsset);
+		const auto * lRename = lFind(lTo);
+		const auto * lUntracked = lFind(lNew);
+		if (!TestNotNull(TEXT("Literal bracketed path"), lEdited) || !TestNotNull(TEXT("Renamed path"), lRename)
+			|| !TestNotNull(TEXT("Untracked path"), lUntracked))
+			return;
+		TestTrue(TEXT("Both staged and working"), lEdited->IsStaged() && lEdited->IsWorking());
+		TestTrue(TEXT("Original path is associated with rename"), lRename->IsStaged() && lRename->OriginalPath == lFrom);
+		TestTrue(TEXT("Untracked appears in Working"), lUntracked->IsUntracked() && lUntracked->IsWorking() && !lUntracked->IsStaged());
+		TestTrue(TEXT("Reverts selected literal path"), BlueprintDiffGit::RevertFile(lGit, lTree.Repository, *lEdited).IsEmpty());
+		TestFalse(TEXT("Stale status cannot revert twice"), BlueprintDiffGit::RevertFile(lGit, lTree.Repository, *lEdited).IsEmpty());
+		if (!TestTrue(TEXT("Independently recreated the original path"), lWrite(lFrom, TEXT("recreated by the user"))))
+			return;
+		TestFalse(TEXT("Revert refuses to replace the recreated file"), BlueprintDiffGit::RevertFile(lGit, lTree.Repository, *lRename).IsEmpty());
+		FString lContent;
+		TestTrue(TEXT("The recreated file is preserved"),
+			FFileHelper::LoadFileToString(lContent, *(m_Fixture / lFrom)) && lContent == TEXT("recreated by the user"));
+		TestTrue(TEXT("The rename remains intact"), FPaths::FileExists(m_Fixture / lTo));
+		if (!TestTrue(TEXT("Removed the fixture collision"), IFileManager::Get().Delete(*(m_Fixture / lFrom), true)))
+			return;
+		TestTrue(TEXT("Reverts rename"), BlueprintDiffGit::RevertFile(lGit, lTree.Repository, *lRename).IsEmpty());
+		TestTrue(TEXT("Old filename restored"), FPaths::FileExists(m_Fixture / lFrom));
+		TestFalse(TEXT("Renamed destination removed"), FPaths::FileExists(m_Fixture / lTo));
+		TestTrue(TEXT("Untracked can be removed explicitly"), BlueprintDiffGit::RevertFile(lGit, lTree.Repository, *lUntracked).IsEmpty());
+		TestTrue(TEXT("Baseline bytes restored"), FFileHelper::LoadFileToString(lContent, *lContext) && lContent == TEXT("baseline"));
+		TestTrue(TEXT("Unrelated local edits preserved"),
+			FFileHelper::LoadFileToString(lContent, *(m_Fixture / lOther)) && lContent == TEXT("other edited"));
+	});
+
+	It("Lists project assets and C++ only and stages inside the owning repository", [this]
+	{
+		const FString lProject = m_Fixture / TEXT("Nested Project");
+		const FString lSource = lProject / TEXT("Source");
+		const FString lPlugin = lProject / TEXT("Plugins/Fixture");
+		const auto lWrite = [&](const FString & aFile)
+		{
+			IFileManager::Get().MakeDirectory(*FPaths::GetPath(aFile), true);
+			return FFileHelper::SaveStringToFile(TEXT("fixture"), *aFile, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+		};
+		for (const FString & lFile : {
+			lProject / TEXT("Content/[Test].UASSET"), lProject / TEXT("Content/Unwanted.umap"),
+			lProject / TEXT("Binaries/Unwanted.dll"), lProject / TEXT("Plugins/Fixture/Source/Plugin.hpp"),
+			lSource / TEXT("Nested.cpp"), lSource / TEXT("Script.py"), m_Fixture / TEXT("Sibling/Other.uasset") })
+		{
+			if (!TestTrue(TEXT("Fixture file written"), lWrite(lFile)))
+				return;
+		}
+		if (!RunFixtureGit(TEXT("init --initial-branch=main"))
+			|| !RunFixtureGit(TEXT("-C \"Nested Project/Source\" init --initial-branch=main"))
+			|| !RunFixtureGit(TEXT("-C \"Nested Project/Plugins/Fixture\" init --initial-branch=main")))
+			return;
+
+		const FString lExecutable = BlueprintDiffGit::GetExecutable();
+		const auto lChanges = BlueprintDiffGit::ReadProjectChanges(lExecutable, lProject, { lPlugin });
+		if (!TestTrue(TEXT("Project status read"), lChanges.Error.IsEmpty())
+			|| !TestEqual(TEXT("Only the asset and two C++ files are returned"), lChanges.Files.Num(), 3))
+			return;
+		const FBlueprintDiffProjectFile * lAsset = lChanges.Files.FindByPredicate([](const auto & aFile)
+			{ return BlueprintDiffGit::IsAssetFile(aFile.Path); });
+		const FBlueprintDiffProjectFile * lCode = lChanges.Files.FindByPredicate([](const auto & aFile)
+			{ return aFile.Path == TEXT("Nested.cpp"); });
+		if (!TestNotNull(TEXT("Uppercase asset suffix recognised"), lAsset) || !TestNotNull(TEXT("Nested Source row"), lCode))
+			return;
+		TestTrue(TEXT("Source row owns the nested Git root"), FPaths::IsSamePath(lCode->Repository, lSource));
+		TestTrue(TEXT("Stages the literal asset path"), BlueprintDiffGit::StageFile(lExecutable, *lAsset).IsEmpty());
+		TestTrue(TEXT("Stages in the nested Source repository"), BlueprintDiffGit::StageFile(lExecutable, *lCode).IsEmpty());
+		const auto lAfter = BlueprintDiffGit::ReadProjectChanges(lExecutable, lProject, { lPlugin });
+		TestEqual(TEXT("Exactly the two selected rows were staged"), lAfter.Files.FilterByPredicate([](const auto & aFile)
+			{ return aFile.IsStaged() && !aFile.IsWorking(); }).Num(), 2);
+		TestTrue(TEXT("The other repository entry is still untracked"), lAfter.Files.ContainsByPredicate([](const auto & aFile)
+			{ return aFile.Path == TEXT("Source/Plugin.hpp") && aFile.IsUntracked(); }));
+	});
+
 	BeforeEach([this]
 	{
 		m_Fixture = FPaths::ConvertRelativePathToFull(FPaths::AutomationTransientDir() / (TEXT("Blueprint Diff Git ") + FGuid::NewGuid().ToString()));

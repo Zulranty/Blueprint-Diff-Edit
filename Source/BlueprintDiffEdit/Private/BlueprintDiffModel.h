@@ -28,11 +28,32 @@ struct FBlueprintGraphChange
 	bool HasRootChanges = false;
 };
 
+enum class EBlueprintSettingKind : uint8
+{
+	None,
+	ClassDefault,
+	ClassSetting,
+	MemberProperty,
+	Member,
+	DispatcherSignature
+};
+
+struct FBlueprintSettingTarget
+{
+	EBlueprintSettingKind Kind = EBlueprintSettingKind::None;
+	FName Member;
+	FName Property;
+	bool IsDispatcher = false;
+
+	bool operator==(const FBlueprintSettingTarget & aOther) const = default;
+};
+
 struct FBlueprintSettingChange
 {
 	FText Label;
 	FText RevisionValue;
 	FText WorkingValue;
+	FBlueprintSettingTarget Target;
 };
 
 struct FBlueprintWidgetChange
@@ -57,4 +78,6 @@ namespace BlueprintDiffModel
 		FBlueprintGraphDiffs * aCachedDiffs = nullptr);
 	TArray<FBlueprintWidgetChange> FindChangedWidgets(const UWidgetBlueprint * aRevision, const UWidgetBlueprint * aWorking);
 	TArray<FBlueprintSettingChange> FindChangedSettings(const UBlueprint * aRevision, const UBlueprint * aWorking);
+	UEdGraph * FindDispatcherSignature(const UBlueprint * aBlueprint, FName aMember);
+	bool RevertSetting(UBlueprint * aWorking, const UBlueprint * aRevision, const FBlueprintSettingTarget & aTarget, FText & aError);
 }

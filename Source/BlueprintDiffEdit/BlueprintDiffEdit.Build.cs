@@ -9,7 +9,9 @@ public class BlueprintDiffEdit : ModuleRules
 		{
 			"Core",
 			"CoreUObject",
+			"Projects",
 			"Engine",
+			"EditorFramework",
 			"UnrealEd",
 			"Slate",
 			"SlateCore",
@@ -22,6 +24,8 @@ public class BlueprintDiffEdit : ModuleRules
 			"Kismet",
 			"BlueprintGraph",
 			"GraphEditor",
+			"PropertyEditor",
+			"MaterialEditor",
 			"UMG",
 			"UMGEditor"
 		});

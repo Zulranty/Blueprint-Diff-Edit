@@ -12,6 +12,7 @@
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
 #include "GraphDiffControl.h"
+#include "K2Node_FunctionEntry.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "UObject/Package.h"
 #include "UObject/UnrealType.h"
@@ -28,7 +29,7 @@ namespace
 		aBlueprint->GetAllGraphs(lGraphs);
 		lGraphs.RemoveAll([aBlueprint](const UEdGraph * aGraph)
 		{
-			if (aGraph->GetOuter() != aBlueprint)
+			if (aGraph->GetOuter() != aBlueprint || aBlueprint->DelegateSignatureGraphs.Contains(aGraph))
 				return true;
 
 			const UEdGraphSchema_K2 * const lSchema = Cast<UEdGraphSchema_K2>(aGraph->GetSchema());
@@ -116,14 +117,31 @@ namespace
 
 	void AddPropertyChanges(TArray<FBlueprintSettingChange> & aChanges, const FText & aSection,
 		const UStruct * aRevisionType, const void * aRevision, const UObject * aRevisionOuter,
-		const UStruct * aWorkingType, const void * aWorking, const UObject * aWorkingOuter)
+		const UStruct * aWorkingType, const void * aWorking, const UObject * aWorkingOuter,
+		FBlueprintSettingTarget aTarget = {})
 	{
 		TArray<FSingleObjectDiffEntry> lProperties;
 		DiffUtils::CompareUnrelatedStructs(aRevisionType, aRevision, aRevisionOuter,
 			aWorkingType, aWorking, aWorkingOuter, lProperties);
 		TArray<FPropertySoftPath> lReportedMaps;
+		TSet<FName> lReportedRoots;
 		for (const FSingleObjectDiffEntry & lProperty : lProperties)
 		{
+			if (aTarget.Kind != EBlueprintSettingKind::None)
+			{
+				const FPropertySoftPath lRoot = lProperty.Identifier.GetRootProperty(1);
+				const FResolvedProperty lOld = lRoot.Resolve(aRevisionType, aRevision);
+				const FResolvedProperty lNew = lRoot.Resolve(aWorkingType, aWorking);
+				const FProperty * const lPropertyRoot = lNew.Property ? lNew.Property : lOld.Property;
+				if (!lPropertyRoot || lReportedRoots.Contains(lPropertyRoot->GetFName()))
+					continue;
+				lReportedRoots.Add(lPropertyRoot->GetFName());
+				aTarget.Property = lPropertyRoot->GetFName();
+				aChanges.Add({ FText::Format(LOCTEXT("SectionProperty", "{0} · {1}"), aSection,
+					FText::FromString(lRoot.ToDisplayName())), ExportValue(lOld), ExportValue(lNew), aTarget });
+				continue;
+			}
+
 			FPropertySoftPath lDisplayPath = lProperty.Identifier;
 			bool lWholeMap = false;
 			for (int32 lDepth = 1; ; ++lDepth)
@@ -153,6 +171,54 @@ namespace
 					? FResolvedProperty() : lDisplayPath.Resolve(aWorkingType, aWorking))
 			});
 		}
+	}
+
+	TConstArrayView<TSharedPtr<FUserPinInfo>> GetDispatcherParameters(const UEdGraph & aGraph)
+	{
+		for (const UEdGraphNode * const lNode : aGraph.Nodes)
+		{
+			if (const UK2Node_FunctionEntry * const lEntry = Cast<UK2Node_FunctionEntry>(lNode))
+				return lEntry->UserDefinedPins;
+		}
+		return {};
+	}
+
+	bool HasDispatcherChanges(const UEdGraph & aBefore, const UEdGraph & aWorking)
+	{
+		const auto lBefore = GetDispatcherParameters(aBefore);
+		const auto lWorking = GetDispatcherParameters(aWorking);
+		if (lBefore.Num() != lWorking.Num())
+			return true;
+
+		for (int32 lIndex = 0; lIndex < lBefore.Num(); ++lIndex)
+		{
+			const FUserPinInfo * const lOld = lBefore[lIndex].Get();
+			const FUserPinInfo * const lNew = lWorking[lIndex].Get();
+			if (bool(lOld) != bool(lNew) || (lOld && (lOld->PinName != lNew->PinName
+				|| lOld->PinType != lNew->PinType || lOld->DesiredPinDirection != lNew->DesiredPinDirection
+				|| lOld->PinDefaultValue != lNew->PinDefaultValue)))
+				return true;
+		}
+		return false;
+	}
+
+	FText DescribeDispatcher(const UEdGraph * aGraph)
+	{
+		if (!aGraph)
+			return LOCTEXT("MissingValue", "Not present");
+		TArray<FString> lParameters;
+		for (const TSharedPtr<FUserPinInfo> & lPin : GetDispatcherParameters(*aGraph))
+		{
+			if (lPin)
+			{
+				FString & lDescription = lParameters.Add_GetRef(FString::Printf(TEXT("%s: %s"),
+					*lPin->PinName.ToString(), *UEdGraphSchema_K2::TypeToText(lPin->PinType).ToString()));
+				if (!lPin->PinDefaultValue.IsEmpty())
+					lDescription += TEXT(" = ") + lPin->PinDefaultValue;
+			}
+		}
+		return lParameters.IsEmpty() ? LOCTEXT("NoDispatcherParameters", "No parameters")
+			: FText::FromString(FString::Join(lParameters, TEXT("\n")));
 	}
 
 	TMap<const UWidget *, FText> DescribeNamedSlots(const UWidgetTree & aTree, const TArray<UWidget *> & aWidgets)
@@ -425,14 +491,23 @@ TArray<FBlueprintSettingChange> BlueprintDiffModel::FindChangedSettings(const UB
 	}
 
 	AddPropertyChanges(lChanges, LOCTEXT("ClassSettings", "Class Settings"), aRevision->GetClass(), aRevision,
-		aRevision->GetPackage(), aWorking->GetClass(), aWorking, aWorking->GetPackage());
+		aRevision->GetPackage(), aWorking->GetClass(), aWorking, aWorking->GetPackage(), { EBlueprintSettingKind::ClassSetting });
 
 	const UObject * const lRevisionDefaults = DiffUtils::GetCDO(aRevision);
 	const UObject * const lWorkingDefaults = DiffUtils::GetCDO(aWorking);
 	if (lRevisionDefaults && lWorkingDefaults)
 	{
 		AddPropertyChanges(lChanges, LOCTEXT("ClassDefaults", "Class Defaults"), lRevisionDefaults->GetClass(), lRevisionDefaults,
-			aRevision->GetPackage(), lWorkingDefaults->GetClass(), lWorkingDefaults, aWorking->GetPackage());
+			aRevision->GetPackage(), lWorkingDefaults->GetClass(), lWorkingDefaults, aWorking->GetPackage(), { EBlueprintSettingKind::ClassDefault });
+		for (FBlueprintSettingChange & lChange : lChanges)
+		{
+			if (lChange.Target.Kind == EBlueprintSettingKind::ClassDefault)
+			{
+				lChange.Target.Member = lChange.Target.Property;
+				lChange.Target.IsDispatcher = FindDispatcherSignature(aWorking, lChange.Target.Member)
+					|| FindDispatcherSignature(aRevision, lChange.Target.Member);
+			}
+		}
 	}
 
 	TSet<FName> lOldVariableNames;
@@ -447,26 +522,49 @@ TArray<FBlueprintSettingChange> BlueprintDiffModel::FindChangedSettings(const UB
 	{
 		lOldVariableNames.Add(lVariable.VarName);
 		const FBPVariableDescription * const lWorkingVariable = lWorkingVariables.FindRef(lVariable.VarName);
+		UEdGraph * const lOldSignature = FindDispatcherSignature(aRevision, lVariable.VarName);
+		UEdGraph * const lNewSignature = FindDispatcherSignature(aWorking, lVariable.VarName);
 		if (!lWorkingVariable)
 		{
-			lChanges.Add({ FText::Format(LOCTEXT("RemovedVariable", "Removed variable {0}"), FText::FromName(lVariable.VarName)),
-				FText::FromName(lVariable.VarName), LOCTEXT("MissingValue", "Not present") });
+			const FText lLabel = lOldSignature ? LOCTEXT("RemovedDispatcher", "Removed event dispatcher {0}") : LOCTEXT("RemovedVariable", "Removed variable {0}");
+			lChanges.Add({ FText::Format(lLabel, FText::FromName(lVariable.VarName)),
+				lOldSignature ? DescribeDispatcher(lOldSignature) : FText::FromName(lVariable.VarName), LOCTEXT("MissingValue", "Not present"),
+				{ EBlueprintSettingKind::Member, lVariable.VarName, NAME_None, lOldSignature != nullptr } });
 		}
 		else
 		{
 			AddPropertyChanges(lChanges, FText::FromName(lVariable.VarName), lVariableType, &lVariable, aRevision->GetPackage(),
-				lVariableType, lWorkingVariable, aWorking->GetPackage());
+				lVariableType, lWorkingVariable, aWorking->GetPackage(),
+				{ EBlueprintSettingKind::MemberProperty, lVariable.VarName, NAME_None, lNewSignature != nullptr });
+			if (lOldSignature && lNewSignature && HasDispatcherChanges(*lOldSignature, *lNewSignature))
+			{
+				lChanges.Add({ FText::Format(LOCTEXT("DispatcherSignature", "Event dispatcher · {0}"), FText::FromName(lVariable.VarName)),
+					DescribeDispatcher(lOldSignature), DescribeDispatcher(lNewSignature),
+					{ EBlueprintSettingKind::DispatcherSignature, lVariable.VarName, NAME_None, true } });
+			}
 		}
 	}
 	for (const FBPVariableDescription & lVariable : aWorking->NewVariables)
 	{
 		if (!lOldVariableNames.Contains(lVariable.VarName))
 		{
-			lChanges.Add({ FText::Format(LOCTEXT("AddedVariable", "Added variable {0}"), FText::FromName(lVariable.VarName)),
-				LOCTEXT("MissingValue", "Not present"), FText::FromName(lVariable.VarName) });
+			const UEdGraph * const lSignature = FindDispatcherSignature(aWorking, lVariable.VarName);
+			const FText lLabel = lSignature ? LOCTEXT("AddedDispatcher", "Added event dispatcher {0}") : LOCTEXT("AddedVariable", "Added variable {0}");
+			lChanges.Add({ FText::Format(lLabel, FText::FromName(lVariable.VarName)),
+				LOCTEXT("MissingValue", "Not present"), lSignature ? DescribeDispatcher(lSignature) : FText::FromName(lVariable.VarName),
+				{ EBlueprintSettingKind::Member, lVariable.VarName, NAME_None, lSignature != nullptr } });
 		}
 	}
 	return lChanges;
+}
+
+UEdGraph * BlueprintDiffModel::FindDispatcherSignature(const UBlueprint * aBlueprint, FName aMember)
+{
+	const auto * lGraph = aBlueprint->DelegateSignatureGraphs.FindByPredicate([aMember](const UEdGraph * aGraph)
+	{
+		return aGraph && aGraph->GetFName() == aMember;
+	});
+	return lGraph ? lGraph->Get() : nullptr;
 }
 
 #undef LOCTEXT_NAMESPACE

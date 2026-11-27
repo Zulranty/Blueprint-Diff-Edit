@@ -1,4 +1,5 @@
 #include "BlueprintDiffFunction.h"
+#include "BlueprintDiffModel.h"
 
 #include "EdGraph/EdGraph.h"
 #include "EdGraphSchema_K2.h"
@@ -173,21 +174,43 @@ bool BlueprintDiffFunction::IsFunction(const UBlueprint * aBlueprint, const UEdG
 		&& aGraph->GetFName() != UEdGraphSchema_K2::FN_UserConstructionScript;
 }
 
-bool BlueprintDiffFunction::Revert(
+static bool RevertGraph(
 	UBlueprint * aWorkingBlueprint,
 	const UBlueprint * aRevisionBlueprint,
 	UEdGraph * aWorkingGraph,
 	UEdGraph * aRevisionGraph,
+	bool aDispatcher,
 	FText & aError)
 {
 	aError = FText::GetEmpty();
+	const auto lIsGraph = [aDispatcher](const UBlueprint * aBlueprint, const UEdGraph * aGraph)
+	{
+		return aDispatcher
+			? BlueprintDiffModel::FindDispatcherSignature(aBlueprint, aGraph->GetFName()) == aGraph && aGraph->GetOuter() == aBlueprint
+			: BlueprintDiffFunction::IsFunction(aBlueprint, aGraph);
+	};
 	if (!aWorkingBlueprint || !aRevisionBlueprint || aWorkingBlueprint->GetOutermost() == aRevisionBlueprint->GetOutermost()
 		|| aWorkingBlueprint->GetClass() != aRevisionBlueprint->GetClass() || (!aWorkingGraph && !aRevisionGraph)
-		|| (aWorkingGraph && !IsFunction(aWorkingBlueprint, aWorkingGraph))
-		|| (aRevisionGraph && !IsFunction(aRevisionBlueprint, aRevisionGraph))
+		|| (aWorkingGraph && !lIsGraph(aWorkingBlueprint, aWorkingGraph))
+		|| (aRevisionGraph && !lIsGraph(aRevisionBlueprint, aRevisionGraph))
 		|| (aWorkingGraph && aRevisionGraph && aWorkingGraph->Schema != aRevisionGraph->Schema))
 	{
-		aError = LOCTEXT("FunctionOnly", "Revert is available for top-level Blueprint function graphs from this asset.");
+		aError = LOCTEXT("GraphOnly", "Revert is available for function and event dispatcher graphs from this Blueprint.");
+		return false;
+	}
+
+	const FName lName = aRevisionGraph ? aRevisionGraph->GetFName() : aWorkingGraph->GetFName();
+	const int32 lOldMemberIndex = aDispatcher ? FBlueprintEditorUtils::FindNewVariableIndex(aRevisionBlueprint, lName) : INDEX_NONE;
+	const int32 lNewMemberIndex = aDispatcher ? FBlueprintEditorUtils::FindNewVariableIndex(aWorkingBlueprint, lName) : INDEX_NONE;
+	const auto lIsDispatcher = [](const UBlueprint * aBlueprint, int32 aIndex)
+	{
+		return aIndex != INDEX_NONE && aBlueprint->NewVariables[aIndex].VarType.PinCategory == UEdGraphSchema_K2::PC_MCDelegate;
+	};
+	if (aDispatcher && ((aRevisionGraph && !lIsDispatcher(aRevisionBlueprint, lOldMemberIndex))
+		|| (aWorkingGraph && !lIsDispatcher(aWorkingBlueprint, lNewMemberIndex))
+		|| (!aWorkingGraph && lNewMemberIndex != INDEX_NONE)))
+	{
+		aError = LOCTEXT("DispatcherMemberMismatch", "The event dispatcher and its signature do not match the current Blueprint.");
 		return false;
 	}
 
@@ -199,18 +222,25 @@ bool BlueprintDiffFunction::Revert(
 			return false;
 		}
 
-		if (FBlueprintEditorUtils::IsFunctionUsed(aWorkingBlueprint, aWorkingGraph->GetFName()))
+		if (FBlueprintEditorUtils::IsFunctionUsed(aWorkingBlueprint, lName)
+			|| (aDispatcher && FBlueprintEditorUtils::IsVariableUsed(aWorkingBlueprint, lName)))
 		{
-			aError = LOCTEXT("FunctionInUse", "Cannot remove this function because the working Blueprint still calls it.");
+			aError = LOCTEXT("GraphInUse", "Cannot remove this member because a Blueprint still uses it.");
 			return false;
 		}
-		const FScopedTransaction lTransaction(LOCTEXT("RemoveAddedFunction", "Revert added Blueprint function"));
+		const FScopedTransaction lTransaction(aDispatcher ? LOCTEXT("RemoveAddedDispatcher", "Revert added event dispatcher")
+			: LOCTEXT("RemoveAddedFunction", "Revert added Blueprint function"));
 		aWorkingBlueprint->Modify();
+		if (aDispatcher)
+		{
+			aWorkingGraph->Modify();
+			FBlueprintEditorUtils::RemoveMemberVariable(aWorkingBlueprint, lName);
+		}
 		FBlueprintEditorUtils::RemoveGraph(aWorkingBlueprint, aWorkingGraph);
 		return true;
 	}
 
-	const FName lRevisionName = aRevisionGraph->GetFName();
+	const FName lRevisionName = lName;
 	if (aWorkingGraph && aWorkingGraph->GetFName() != lRevisionName)
 	{
 		aError = LOCTEXT("CannotRevertRename",
@@ -222,12 +252,23 @@ bool BlueprintDiffFunction::Revert(
 		aError = LOCTEXT("NameInUse", "The function name from the selected revision is already in use.");
 		return false;
 	}
+	if (aDispatcher && !aWorkingGraph)
+	{
+		const FBPVariableDescription & lOldVariable = aRevisionBlueprint->NewVariables[lOldMemberIndex];
+		if (aWorkingBlueprint->NewVariables.ContainsByPredicate([&lOldVariable](const FBPVariableDescription & aVariable)
+			{ return aVariable.VarGuid == lOldVariable.VarGuid; }))
+		{
+			aError = LOCTEXT("DispatcherIdentityInUse", "The working Blueprint already has this event dispatcher under a different name.");
+			return false;
+		}
+	}
 
 	UEdGraph * const lStagedGraph = StageFunction(aWorkingBlueprint, aRevisionBlueprint, aWorkingGraph, aRevisionGraph, aError);
 	if (!lStagedGraph)
 		return false;
 
-	FScopedTransaction lTransaction(LOCTEXT("RevertFunction", "Revert Blueprint function to compared revision"));
+	FScopedTransaction lTransaction(aDispatcher ? LOCTEXT("RevertDispatcher", "Revert event dispatcher to compared revision")
+		: LOCTEXT("RevertFunction", "Revert Blueprint function to compared revision"));
 	if (aWorkingGraph)
 	{
 		if (!MoveFunctionContents(lStagedGraph, aWorkingGraph))
@@ -251,10 +292,28 @@ bool BlueprintDiffFunction::Revert(
 		}
 		lStagedGraph->ClearFlags(RF_Transient);
 		aWorkingBlueprint->Modify();
-		aWorkingBlueprint->FunctionGraphs.Add(lStagedGraph);
+		if (aDispatcher)
+		{
+			aWorkingBlueprint->NewVariables.Add(aRevisionBlueprint->NewVariables[lOldMemberIndex]);
+			aWorkingBlueprint->DelegateSignatureGraphs.Add(lStagedGraph);
+		}
+		else
+			aWorkingBlueprint->FunctionGraphs.Add(lStagedGraph);
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(aWorkingBlueprint);
 	}
 	return true;
+}
+
+bool BlueprintDiffFunction::Revert(UBlueprint * aWorkingBlueprint, const UBlueprint * aRevisionBlueprint,
+	UEdGraph * aWorkingGraph, UEdGraph * aRevisionGraph, FText & aError)
+{
+	return RevertGraph(aWorkingBlueprint, aRevisionBlueprint, aWorkingGraph, aRevisionGraph, false, aError);
+}
+
+bool BlueprintDiffFunction::RevertDispatcher(UBlueprint * aWorkingBlueprint, const UBlueprint * aRevisionBlueprint,
+	UEdGraph * aWorkingGraph, UEdGraph * aRevisionGraph, FText & aError)
+{
+	return RevertGraph(aWorkingBlueprint, aRevisionBlueprint, aWorkingGraph, aRevisionGraph, true, aError);
 }
 
 #undef LOCTEXT_NAMESPACE

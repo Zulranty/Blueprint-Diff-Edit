@@ -4,7 +4,9 @@
 
 #include "BlueprintDiffFunction.h"
 #include "Async/Async.h"
+#include "BlueprintEditor.h"
 #include "BlueprintEditorModule.h"
+#include "BlueprintEditorTabs.h"
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetTree.h"
 #include "Components/NamedSlot.h"
@@ -23,19 +25,26 @@
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "GraphDiffControl.h"
 #include "GraphEditor.h"
+#include "IDetailsView.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformApplicationMisc.h"
 #include "ISourceControlModule.h"
 #include "ISourceControlRevision.h"
 #include "ISourceControlState.h"
+#include "ISinglePropertyView.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/PackageName.h"
 #include "Misc/PackagePath.h"
+#include "Modules/ModuleManager.h"
+#include "PropertyEditorModule.h"
+#include "SMyBlueprint.h"
 #include "SourceControlOperations.h"
 #include "UObject/Linker.h"
 #include "UObject/Package.h"
+#include "UObject/UnrealType.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SComboButton.h"
@@ -76,6 +85,7 @@ struct FBlueprintDiffSnapshot
 namespace
 {
 	const FName DESIGNER_MODE(TEXT("DesignerName"));
+	const FName GRAPH_MODE(TEXT("GraphName"));
 
 	TSharedRef<SWidget> BuildValueComparison(const FBlueprintDiffChange & aChange)
 	{
@@ -95,8 +105,10 @@ namespace
 	}
 
 	constexpr TCHAR LAYOUT_SECTION[] = TEXT("BlueprintDiffEdit.Layout");
-	constexpr const TCHAR * PANE_SIZE_KEYS[] = { TEXT("DiffWidth"), TEXT("FunctionsWidth"), TEXT("RevisionControlsHeight") };
-	constexpr float DEFAULT_PANE_SIZES[] = { 0.43f, 0.40f, 0.18f };
+	constexpr const TCHAR * PANE_SIZE_KEYS[] = {
+		TEXT("DiffWidth"), TEXT("FunctionsWidth"), TEXT("RevisionControlsHeight"), TEXT("FunctionsHeight")
+	};
+	constexpr float DEFAULT_PANE_SIZES[] = { 0.43f, 0.40f, 0.18f, 0.54f };
 	TMulticastDelegate<void(int32, float)> OnPaneSizeChanged;
 
 	float GetSavedPaneSize(int32 aSplit)
@@ -202,6 +214,11 @@ void SBlueprintDiffEdit::Construct(const FArguments & aArgs, const TSharedRef<IB
 	m_LastFocusedWorkingGraph = aEditor->GetFocusedGraph();
 	m_HostTab = aHostTab;
 	m_WorkingBlueprint = aBlueprint;
+	if (FPackageName::TryConvertLongPackageNameToFilename(aBlueprint->GetOutermost()->GetName(),
+		m_Filename, FPackageName::GetAssetPackageExtension()))
+		m_Filename = FPaths::ConvertRelativePathToFull(m_Filename);
+	else
+		m_Filename.Reset();
 	m_OriginalContent = aHostTab->GetContent();
 	aHostTab->SetContent(SNullWidget::NullWidget);
 	m_RevisionCommands = MakeShared<FUICommandList>();
@@ -262,16 +279,19 @@ void SBlueprintDiffEdit::Construct(const FArguments & aArgs, const TSharedRef<IB
 			.SelectionMode(ESelectionMode::Single)
 			.OnGenerateRow(this, &SBlueprintDiffEdit::DoBuildChangeRow)
 			.OnSelectionChanged(this, &SBlueprintDiffEdit::DoFocusChange)
+			.OnMouseButtonClick(this, &SBlueprintDiffEdit::DoSelectSettingMember)
+			.OnContextMenuOpening(this, &SBlueprintDiffEdit::DoBuildSettingMenu)
 		];
 
 	constexpr float HANDLE_SIZE = 5.0f;
 	constexpr float HANDLE_HIT_SIZE = 10.0f;
-	constexpr float MIN_FUNCTIONS_WIDTH = 128.0f;
+	constexpr float MIN_FUNCTIONS_WIDTH = 176.0f;
 	constexpr float MIN_REVISION_WIDTH = 224.0f;
 	static_assert(UE_ARRAY_COUNT(PANE_SIZE_KEYS) == PaneSplitCount && UE_ARRAY_COUNT(DEFAULT_PANE_SIZES) == PaneSplitCount);
 	const float lOuterSize = GetSavedPaneSize(OuterSplit);
 	const float lFunctionsSize = GetSavedPaneSize(FunctionsSplit);
 	const float lRevisionSize = GetSavedPaneSize(RevisionSplit);
+	const float lChangedFilesSize = GetSavedPaneSize(ChangedFilesSplit);
 
 	ChildSlot
 	[
@@ -292,7 +312,23 @@ void SBlueprintDiffEdit::Construct(const FArguments & aArgs, const TSharedRef<IB
 				.HitDetectionSplitterHandleSize(HANDLE_HIT_SIZE)
 				+ SSplitter::Slot().Value(lFunctionsSize).MinSize(MIN_FUNCTIONS_WIDTH)
 				[
-					lFunctions
+					SAssignNew(m_Splitters[ChangedFilesSplit], SSplitter)
+					.Orientation(Orient_Vertical)
+					.OnSplitterFinishedResizing(this, &SBlueprintDiffEdit::DoSavePaneSize, ChangedFilesSplit)
+					.PhysicalSplitterHandleSize(HANDLE_SIZE)
+					.HitDetectionSplitterHandleSize(HANDLE_HIT_SIZE)
+					+ SSplitter::Slot().Value(lChangedFilesSize).MinSize(64.0f)
+					[
+						lFunctions
+					]
+					+ SSplitter::Slot().Value(1.0f - lChangedFilesSize).MinSize(128.0f)
+					[
+						SNew(SBlueprintDiffChanges)
+						.Compact(true)
+						.ContextFilename(m_Filename.IsEmpty() ? FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath()) : m_Filename)
+						.OnOpenBlueprint(aArgs._OnOpenBlueprint)
+						.OnBeforeReload(aArgs._OnBeforeReload)
+					]
 				]
 				+ SSplitter::Slot().Value(1.0f - lFunctionsSize).MinSize(MIN_REVISION_WIDTH)
 				[
@@ -328,12 +364,8 @@ void SBlueprintDiffEdit::Construct(const FArguments & aArgs, const TSharedRef<IB
 	FCoreUObjectDelegates::OnObjectModified.AddSP(this, &SBlueprintDiffEdit::DoOnObjectModified);
 	FCoreUObjectDelegates::OnObjectTransacted.AddSP(this, &SBlueprintDiffEdit::DoOnObjectTransacted);
 	DoBuildRevisionGraph(nullptr);
-	if (FPackageName::TryConvertLongPackageNameToFilename(aBlueprint->GetOutermost()->GetName(),
-		m_Filename, FPackageName::GetAssetPackageExtension()))
-	{
-		m_Filename = FPaths::ConvertRelativePathToFull(m_Filename);
+	if (!m_Filename.IsEmpty())
 		DoUpdateHistory();
-	}
 	else
 		m_Status = LOCTEXT("NoPackageFile", "The working Blueprint does not have a source-controlled package path.");
 }
@@ -360,6 +392,14 @@ SBlueprintDiffEdit::~SBlueprintDiffEdit()
 bool SBlueprintDiffEdit::IsHostedBy(const SDockTab * aTab) const
 {
 	return m_HostTab.Pin().Get() == aTab;
+}
+
+bool SBlueprintDiffEdit::IsEditingAnyFile(const TArray<FString> & aFiles) const
+{
+	return aFiles.ContainsByPredicate([this](const FString & aFile)
+	{
+		return FPaths::IsSamePath(m_Filename, aFile);
+	});
 }
 
 void SBlueprintDiffEdit::Close()
@@ -537,7 +577,7 @@ void SBlueprintDiffEdit::DoReceiveHistory(const FSourceControlOperationRef &, EC
 TSharedRef<SWidget> SBlueprintDiffEdit::DoBuildRevisionMenu()
 {
 	FMenuBuilder lMenu(true, nullptr);
-	lMenu.AddMenuEntry(LOCTEXT("CompareMaster", "Compare with master"),
+	lMenu.AddMenuEntry(LOCTEXT("CompareMaster", "Compare with default branch"),
 		LOCTEXT("CompareMasterTip", "Compare the working Blueprint with origin/master, or local master if origin/master is absent."),
 		FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SBlueprintDiffEdit::DoStartMasterComparison)));
 	if (m_HistoryAvailable)
@@ -854,6 +894,13 @@ void SBlueprintDiffEdit::DoSelectGraph(FGraphPtr aGraph, ESelectInfo::Type aSele
 
 	const bool lSameRootGraph = aGraph && m_SelectedGraph && IsSameRootGraph(aGraph->Root, m_SelectedGraph->Root);
 	m_SelectedGraph = aGraph;
+	if (!aGraph || aGraph->Section != EBlueprintDiffSection::Settings)
+	{
+		m_ActiveSetting.Reset();
+		m_SettingComparison.Reset();
+		m_SingleSettingEditor.Reset();
+		m_SettingObject.Reset();
+	}
 	FBlueprintGraphPair lGraphs;
 	if (aGraph && aGraph->Section == EBlueprintDiffSection::Graph)
 	{
@@ -897,7 +944,9 @@ void SBlueprintDiffEdit::DoShowGraphPair(const FBlueprintGraphPair & aPair, bool
 	UEdGraph * const lWorkingGraph = aPair.Working.Get();
 	const bool lShowingWidgetPreview = m_SelectedGraph
 		&& m_SelectedGraph->Section == EBlueprintDiffSection::Widgets && m_WidgetValuesBox.IsValid();
-	if (!lShowingWidgetPreview && (!lOldGraph || !m_RevisionGraphEditor || m_RevisionGraphEditor->GetCurrentGraph() != lOldGraph))
+	const bool lShowingSettings = m_SelectedGraph
+		&& m_SelectedGraph->Section == EBlueprintDiffSection::Settings && m_SettingComparison.IsValid();
+	if (!lShowingSettings && !lShowingWidgetPreview && (!lOldGraph || !m_RevisionGraphEditor || m_RevisionGraphEditor->GetCurrentGraph() != lOldGraph))
 	{
 		m_NodeHighlights->Reset();
 		DoBuildRevisionGraph(lOldGraph);
@@ -1036,12 +1085,12 @@ void SBlueprintDiffEdit::DoRefreshGraphHighlights()
 
 void SBlueprintDiffEdit::DoRefreshChanges()
 {
-	FText lSelectedWidgetChange;
-	if (m_SelectedGraph && m_SelectedGraph->Section == EBlueprintDiffSection::Widgets)
+	FChangePtr lPrevious;
+	if (m_SelectedGraph && m_SelectedGraph->Section != EBlueprintDiffSection::Graph)
 	{
 		const TArray<FChangePtr> lSelected = m_ChangeList->GetSelectedItems();
 		if (!lSelected.IsEmpty())
-			lSelectedWidgetChange = lSelected[0]->Label;
+			lPrevious = lSelected[0];
 	}
 	m_Changes.Reset();
 	if (m_SelectedGraph && m_SelectedGraph->Section == EBlueprintDiffSection::Settings)
@@ -1049,7 +1098,8 @@ void SBlueprintDiffEdit::DoRefreshChanges()
 		for (const FBlueprintSettingChange & lChange : m_Settings)
 		{
 			m_Changes.Add(MakeShared<FBlueprintDiffChange>(FBlueprintDiffChange{
-				{}, {}, lChange.Label, FSlateColor::UseForeground(), {}, lChange.RevisionValue, lChange.WorkingValue }));
+				{}, {}, lChange.Label, FSlateColor::UseForeground(), {}, lChange.RevisionValue, lChange.WorkingValue,
+				NAME_None, lChange.Target }));
 		}
 	}
 	else if (m_SelectedGraph && m_SelectedGraph->Section == EBlueprintDiffSection::Widgets)
@@ -1117,9 +1167,10 @@ void SBlueprintDiffEdit::DoRefreshChanges()
 	m_ChangeList->RequestListRefresh();
 	if (m_SelectedGraph && m_SelectedGraph->Section != EBlueprintDiffSection::Graph && !m_Changes.IsEmpty())
 	{
-		const FChangePtr * const lSelected = m_Changes.FindByPredicate([&lSelectedWidgetChange](const FChangePtr & aChange)
+		const FChangePtr * const lSelected = m_Changes.FindByPredicate([&lPrevious](const FChangePtr & aChange)
 		{
-			return aChange->Label.EqualTo(lSelectedWidgetChange);
+			return lPrevious && (aChange->Setting.Kind != EBlueprintSettingKind::None
+				? aChange->Setting == lPrevious->Setting : aChange->Label.EqualTo(lPrevious->Label));
 		});
 		m_ChangeList->SetSelection(lSelected ? *lSelected : m_Changes[0], ESelectInfo::Direct);
 	}
@@ -1134,7 +1185,9 @@ void SBlueprintDiffEdit::DoFocusChange(FChangePtr aChange, ESelectInfo::Type aSe
 
 	if (m_SelectedGraph->Section == EBlueprintDiffSection::Settings)
 	{
-		m_RevisionGraphBox->SetContent(BuildValueComparison(*aChange));
+		DoShowSettingChange(aChange);
+		if (aSelectInfo == ESelectInfo::OnNavigation || aSelectInfo == ESelectInfo::OnKeyPress)
+			DoSelectSettingMember(aChange);
 		return;
 	}
 	if (m_SelectedGraph->Section == EBlueprintDiffSection::Widgets)
@@ -1152,6 +1205,138 @@ void SBlueprintDiffEdit::DoFocusChange(FChangePtr aChange, ESelectInfo::Type aSe
 		m_FocusDeadline = FPlatformTime::Seconds() + 2.0;
 		m_FocusHandle = FSlateApplication::Get().OnPostTick().AddSP(this, &SBlueprintDiffEdit::DoApplyPendingFocus);
 	}
+}
+
+void SBlueprintDiffEdit::DoSelectSettingMember(FChangePtr aChange)
+{
+	if (!aChange || aChange->Setting.Member.IsNone())
+		return;
+	const TSharedPtr<IBlueprintEditor> lEditor = m_Editor.Pin();
+	const UBlueprint * const lBlueprint = m_WorkingBlueprint.Get();
+	if (!lEditor || !lBlueprint)
+		return;
+
+	const FBlueprintSettingTarget & lTarget = aChange->Setting;
+	const UObject * const lDefaults = DiffUtils::GetCDO(lBlueprint);
+	const FProperty * const lProperty = lDefaults ? FindFProperty<FProperty>(lDefaults->GetClass(), lTarget.Member) : nullptr;
+	if (FBlueprintEditorUtils::FindNewVariableIndex(lBlueprint, lTarget.Member) == INDEX_NONE
+		&& !(lTarget.Kind == EBlueprintSettingKind::ClassDefault && lProperty))
+		return;
+
+	FBlueprintEditor & lNative = static_cast<FBlueprintEditor &>(*lEditor);
+	if (Cast<UWidgetBlueprint>(lBlueprint) && lEditor->GetToolkitFName() == TEXT("WidgetBlueprintEditor")
+		&& lNative.GetCurrentMode() == DESIGNER_MODE)
+	{
+		lNative.SetCurrentMode(GRAPH_MODE);
+		m_LastFocusedWorkingGraph = lEditor->GetFocusedGraph();
+	}
+	const TSharedPtr<FTabManager> lTabs = lNative.GetTabManager();
+	if (!lTabs->FindExistingLiveTab(FBlueprintEditorTabs::MyBlueprintID))
+		lTabs->TryInvokeTab(FBlueprintEditorTabs::MyBlueprintID);
+	if (!lTabs->FindExistingLiveTab(FBlueprintEditorTabs::DetailsID))
+		lTabs->TryInvokeTab(FBlueprintEditorTabs::DetailsID);
+	if (const TSharedPtr<SMyBlueprint> lMyBlueprint = lNative.GetMyBlueprintWidget())
+	{
+		const bool lDispatcher = lTarget.IsDispatcher || (lProperty && lProperty->IsA<FMulticastDelegateProperty>());
+		lMyBlueprint->SelectItemByName(lTarget.Member, ESelectInfo::OnMouseClick,
+			lDispatcher ? NodeSectionID::DELEGATE : NodeSectionID::VARIABLE);
+	}
+}
+
+void SBlueprintDiffEdit::DoShowSettingChange(const FChangePtr & aChange)
+{
+	const FBlueprintSettingTarget & lTarget = aChange->Setting;
+	const TSharedPtr<IBlueprintEditor> lEditor = m_Editor.Pin();
+	UBlueprint * const lBlueprint = m_WorkingBlueprint.Get();
+	UObject * lObject = nullptr;
+	FName lPropertyName;
+	if (lBlueprint && lEditor)
+	{
+		if (lTarget.Kind == EBlueprintSettingKind::ClassSetting)
+		{
+			lObject = lBlueprint;
+			lPropertyName = lTarget.Property;
+		}
+		else if (lTarget.Kind == EBlueprintSettingKind::ClassDefault || (lTarget.Kind == EBlueprintSettingKind::Member && !lTarget.IsDispatcher))
+		{
+			lObject = const_cast<UObject *>(DiffUtils::GetCDO(lBlueprint));
+			lPropertyName = lTarget.Member;
+		}
+	}
+	const bool lSameSetting = m_ActiveSetting && lTarget.Kind != EBlueprintSettingKind::None
+		&& lTarget == m_ActiveSetting->Setting && m_SettingObject.Get() == lObject;
+	m_ActiveSetting = aChange;
+	if (lSameSetting && m_SettingComparison)
+		return;
+
+	m_SettingObject = lObject;
+	m_SingleSettingEditor.Reset();
+	TSharedPtr<SWidget> lValueEditor;
+	const FProperty * const lProperty = lObject ? FindFProperty<FProperty>(lObject->GetClass(), lPropertyName) : nullptr;
+	if (lProperty && lProperty->HasAnyPropertyFlags(CPF_Edit) && !lProperty->HasAnyPropertyFlags(CPF_EditConst | CPF_DisableEditOnTemplate)
+		&& !lProperty->IsA<FMulticastDelegateProperty>() && !lProperty->IsA<FDelegateProperty>())
+	{
+		FPropertyEditorModule & lModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
+		FBlueprintEditor & lNative = static_cast<FBlueprintEditor &>(*lEditor);
+		FSinglePropertyParams lParams;
+		lParams.NamePlacement = EPropertyNamePlacement::Hidden;
+		lParams.NotifyHook = &lNative;
+		lParams.bHideResetToDefault = true;
+		m_SingleSettingEditor = lModule.CreateSingleProperty(lObject, lPropertyName, lParams);
+		if (m_SingleSettingEditor && m_SingleSettingEditor->HasValidProperty())
+			lValueEditor = m_SingleSettingEditor;
+		else
+		{
+			FDetailsViewArgs lArgs;
+			lArgs.bAllowSearch = false;
+			lArgs.bShowOptions = false;
+			lArgs.bShowObjectLabel = false;
+			lArgs.bHideSelectionTip = true;
+			lArgs.NameAreaSettings = FDetailsViewArgs::HideNameArea;
+			lArgs.NotifyHook = &lNative;
+			const TSharedRef<IDetailsView> lDetails = lModule.CreateDetailView(lArgs);
+			lDetails->SetIsPropertyVisibleDelegate(FIsPropertyVisible::CreateLambda([lPropertyName](const FPropertyAndParent & aProperty)
+			{
+				const FProperty * const lRoot = aProperty.ParentProperties.IsEmpty() ? &aProperty.Property : aProperty.ParentProperties.Last();
+				return lRoot->GetFName() == lPropertyName;
+			}));
+			lDetails->SetObject(lObject);
+			lValueEditor = lDetails;
+		}
+	}
+	m_SettingComparison = SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.0f)
+		[
+			SNew(STextBlock).Text_Lambda([this] { return m_ActiveSetting ? m_ActiveSetting->Label : FText(); }).AutoWrapText(true)
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.0f)
+		[
+			SNew(SBox).MaxDesiredHeight(110.0f)
+			[
+				SNew(SScrollBox)
+				+ SScrollBox::Slot()
+				[
+					SNew(STextBlock).Text_Lambda([this]
+					{
+						return m_ActiveSetting ? FText::Format(LOCTEXT("RevisionSetting", "Revision\n{0}"), m_ActiveSetting->RevisionValue) : FText();
+					}).AutoWrapText(true)
+				]
+			]
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.0f, 4.0f)
+		[
+			SNew(STextBlock).Text(LOCTEXT("WorkingSettingLabel", "Working Blueprint"))
+		]
+		+ SVerticalBox::Slot().FillHeight(1.0f).Padding(8.0f, 0.0f)
+		[
+			lValueEditor ? StaticCastSharedRef<SWidget>(SNew(SBox).VAlign(VAlign_Top)
+				.IsEnabled(this, &SBlueprintDiffEdit::CanEditBlueprint)[lValueEditor.ToSharedRef()])
+				: StaticCastSharedRef<SWidget>(SNew(SScrollBox) + SScrollBox::Slot()
+				[
+					SNew(STextBlock).Text_Lambda([this] { return m_ActiveSetting ? m_ActiveSetting->WorkingValue : FText(); }).AutoWrapText(true)
+				])
+		];
+	m_RevisionGraphBox->SetContent(m_SettingComparison.ToSharedRef());
 }
 
 TSharedRef<SWidget> SBlueprintDiffEdit::DoGetWidgetPreview()
@@ -1370,15 +1555,51 @@ TSharedRef<ITableRow> SBlueprintDiffEdit::DoBuildChangeRow(FChangePtr aChange, c
 	];
 }
 
+bool SBlueprintDiffEdit::CanEditBlueprint() const
+{
+	const TSharedPtr<IBlueprintEditor> lEditor = m_Editor.Pin();
+	return lEditor && lEditor->GetOpenMethod() == EAssetOpenMethod::Edit && !GEditor->PlayWorld
+		&& !lEditor->GetTabManager()->IsReadOnly() && m_WorkingBlueprint.IsValid();
+}
+
+TSharedPtr<SWidget> SBlueprintDiffEdit::DoBuildSettingMenu()
+{
+	const TArray<FChangePtr> lSelected = m_ChangeList->GetSelectedItems();
+	if (lSelected.IsEmpty() || lSelected[0]->Setting.Kind == EBlueprintSettingKind::None
+		|| !m_RevisionBlueprint || m_RevisionRequest.IsValid() || !CanEditBlueprint())
+		return nullptr;
+
+	FMenuBuilder lMenu(true, nullptr);
+	lMenu.AddMenuEntry(LOCTEXT("RevertSettingMenu", "Revert to Compared Revision"),
+		LOCTEXT("RevertSettingTip", "Restore this value or member from the displayed revision. You can undo this action."),
+		FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SBlueprintDiffEdit::DoRevertSetting,
+			lSelected[0]->Setting, TWeakObjectPtr<UBlueprint>(m_RevisionBlueprint.Get()))));
+	return lMenu.MakeWidget();
+}
+
+void SBlueprintDiffEdit::DoRevertSetting(FBlueprintSettingTarget aSetting, TWeakObjectPtr<UBlueprint> aRevision)
+{
+	if (!aRevision.IsValid() || m_RevisionBlueprint.Get() != aRevision.Get() || m_RevisionRequest.IsValid() || !CanEditBlueprint())
+		return;
+	FText lError;
+	if (!BlueprintDiffModel::RevertSetting(m_WorkingBlueprint.Get(), aRevision.Get(), aSetting, lError))
+	{
+		if (!lError.IsEmpty())
+			FMessageDialog::Open(EAppMsgType::Ok, lError);
+		return;
+	}
+
+	m_RefreshAt = 0.0;
+	DoRebuildGraphList();
+}
+
 bool SBlueprintDiffEdit::CanRevertFunction(const FGraphPtr & aGraph) const
 {
 	if (m_RevisionRequest.IsValid() || !aGraph || aGraph->Section != EBlueprintDiffSection::Graph
 		|| !m_RevisionBlueprint.IsValid() || !m_WorkingBlueprint.IsValid())
 		return false;
 
-	const TSharedPtr<IBlueprintEditor> lEditor = m_Editor.Pin();
-	if (!lEditor || lEditor->GetOpenMethod() != EAssetOpenMethod::Edit || GEditor->PlayWorld
-		|| lEditor->GetTabManager()->IsReadOnly())
+	if (!CanEditBlueprint())
 		return false;
 
 	const UEdGraph * const lOldGraph = aGraph->Root.Revision.Get();
